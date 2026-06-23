@@ -1,0 +1,211 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import asyncio
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import cv2
+import websockets
+import mediapipe as mp
+
+from utils import SENSOR_HOST, SENSOR_PORT, setup_logger
+
+log = setup_logger("SENSOR")
+
+
+def init_mediapipe():
+    model_path = Path("hand_landmarker.task")
+    if not model_path.exists():
+        log.error(f"Файл {model_path} не найден!")
+
+        return None
+
+    try:
+        from mediapipe.tasks import python
+        from mediapipe.tasks.python import vision
+
+        base_options = python.BaseOptions(model_asset_path=str(model_path))
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            num_hands=1,
+        )
+        landmarker = vision.HandLandmarker.create_from_options(options)
+        log.info("MediaPipe готов")
+        return landmarker
+    except Exception as e:
+        log.error(f"Не получилось инициализировать MediaPipe: {e}")
+        return None
+
+
+def count_fingers(landmarks) -> int:
+    if not landmarks:
+        return 0
+
+    fingers = 0
+    wrist = landmarks[0]
+
+    tips = [8, 12, 16, 20]
+    pips = [6, 10, 14, 18]
+    for tip_idx, pip_idx in zip(tips, pips):
+        tip_dist = (landmarks[tip_idx].y - wrist.y) ** 2
+        pip_dist = (landmarks[pip_idx].y - wrist.y) ** 2
+        if tip_dist > pip_dist:
+            fingers += 1
+
+    thumb_dist = ((landmarks[4].x - landmarks[17].x) ** 2 +
+                  (landmarks[4].y - landmarks[17].y) ** 2)
+    thumb_base_dist = ((landmarks[3].x - landmarks[17].x) ** 2 +
+                       (landmarks[3].y - landmarks[17].y) ** 2)
+    if thumb_dist > thumb_base_dist:
+        fingers += 1
+
+    return fingers
+
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
+
+def draw_hand(frame, landmarks) -> int:
+    h, w, _ = frame.shape
+
+    for lm in landmarks:
+        cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 5, (0, 0, 255), -1)
+
+    for start, end in HAND_CONNECTIONS:
+        pt1 = (int(landmarks[start].x * w), int(landmarks[start].y * h))
+        pt2 = (int(landmarks[end].x * w), int(landmarks[end].y * h))
+        cv2.line(frame, pt1, pt2, (0, 255, 255), 2)
+
+    fingers = count_fingers(landmarks)
+    cv2.putText(
+        frame, f"Fingers: {fingers}", (30, 50),
+        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
+    )
+    return fingers
+
+
+async def sensor_loop(websocket):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        log.error("Камера не открывается")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    landmarker = init_mediapipe()
+    if landmarker is None:
+        cap.release()
+        return
+
+    log.info("Камера работает, 'q' для выхода")
+
+    loop = asyncio.get_event_loop()
+    executor = ThreadPoolExecutor(max_workers=2)
+    frame_count = 0
+    last_log = time.time()
+
+    try:
+        while True:
+            try:
+                success, frame = await loop.run_in_executor(executor, cap.read)
+            except Exception as e:
+                log.error(f"Кадр не прочитался: {e}")
+                await asyncio.sleep(0.5)
+                continue
+
+            if not success:
+                log.warning("Пустой кадр от камеры")
+                await asyncio.sleep(0.1)
+                continue
+
+            frame = cv2.flip(frame, 1)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            try:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+                result = await loop.run_in_executor(executor, landmarker.detect, mp_image)
+            except Exception as e:
+                log.error(f"MediaPipe упал: {e}")
+                result = None
+
+            if result and result.hand_landmarks:
+                fingers = draw_hand(frame, result.hand_landmarks[0])
+            else:
+                fingers = 0
+                cv2.putText(frame, "No hand", (30, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+            cv2.imshow("Vision Sensor Feed", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                log.info("Закрытие по 'q'")
+                break
+
+            try:
+                await asyncio.wait_for(
+                    websocket.send(json.dumps({
+                        "fingers": fingers,
+                        "hand_detected": bool(result and result.hand_landmarks),
+                        "timestamp": time.time()
+                    })),
+                    timeout=0.1,
+                )
+            except asyncio.TimeoutError:
+                log.debug("Агент не успевает, пропускаю")
+            except websockets.ConnectionClosed:
+                log.warning("Агент отвалился")
+                break
+
+            frame_count += 1
+            if time.time() - last_log >= 5:
+                log.info(f"{frame_count} кадров за 5 сек, последний: {fingers} пальцев")
+                frame_count = 0
+                last_log = time.time()
+
+            await asyncio.sleep(0.03)
+
+    except Exception as e:
+        log.error(f"Что-то пошло совсем не так: {e}", exc_info=True)
+    finally:
+        executor.shutdown(wait=False)
+        cap.release()
+        cv2.destroyAllWindows()
+        log.info("Камера отключена")
+
+
+async def handle_sensor_client(websocket):
+    peer = websocket.remote_address
+    log.info(f"Агент подключился: {peer}")
+    try:
+        await sensor_loop(websocket)
+    except Exception as e:
+        log.error(f"Сессия с агентом упала: {e}", exc_info=True)
+    finally:
+        log.info(f"Агент отвалился: {peer}")
+
+
+async def main():
+    log.info(f"Сенсор слушает ws://{SENSOR_HOST}:{SENSOR_PORT}")
+    async with websockets.serve(handle_sensor_client, SENSOR_HOST, SENSOR_PORT):
+        log.info("Жду агента...")
+        await asyncio.Future()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Закрыто по Ctrl+C")
