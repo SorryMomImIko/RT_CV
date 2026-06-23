@@ -166,9 +166,7 @@
     </div>
 
     <script>
-        // ─────────────────────────────────────────────
-        // РУЧНОЕ УПРАВЛЕНИЕ
-        // ─────────────────────────────────────────────
+        
         function toggleBulb(id) {
             document.getElementById(`bulb-${id}`).classList.toggle('on');
         }
@@ -179,9 +177,9 @@
             }
         }
 
-        // ─────────────────────────────────────────────
+     
         // УПРАВЛЕНИЕ ОТ АГЕНТА
-        // ─────────────────────────────────────────────
+       
         function updateBulbsFromAgent(data) {
             const states = data.states || [];
             const brightness = data.brightness || "bright";
@@ -214,9 +212,9 @@
             }
         }
 
-        // ─────────────────────────────────────────────
+ 
         // WEBSOCKET С АВТОПЕРЕПОДКЛЮЧЕНИЕМ
-        // ─────────────────────────────────────────────
+    
         const wsStatusDisplay = document.getElementById('ws-status');
         const lastCommandDisplay = document.getElementById('last-command');
         const statsLineDisplay = document.getElementById('stats-line');
