@@ -1,5 +1,6 @@
 import sys
 import os
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import asyncio
@@ -18,212 +19,152 @@ from utils import (
 
 log = setup_logger("AGENT")
 
+SYSTEM_PROMPT = """Task: convert finger count to lamp array.
+
+Rule: for N fingers, lamps[0..N-1] = true, lamps[N..4] = false.
+Example: 3 fingers -> [true,true,true,false,false]
+Example: 0 fingers -> [false,false,false,false,false]
+
+Output JSON only, no text:
+{"states":[b,b,b,b,b],"brightness":"bright"}"""
+
 
 class SmartHomeAgent:
-
-    SYSTEM_PROMPT = """Output JSON only. Schema:
-{"states": [b,b,b,b,b], "brightness": "bright"}
-b is true if lamp is on.
-For N fingers: first N are true, rest false.
-brightness is "bright" or "dim" (echo current mode).
-No text. No markdown. Only JSON."""
 
     def __init__(self, model: str = OLLAMA_MODEL):
         self.model = model
         self.bulb_states = [False] * NUM_BULBS
-
         self.history = []
         self.dim_mode = False
         self.last_fingers = -1
-        self.pattern_cooldown = 0
-
         self.llm_calls = 0
         self.cache_hits = 0
-        self.pattern_detections = 0
+        self.gesture_detections = 0
+        self.skipped_unstable = 0
 
         log.info(f"SmartHomeAgent создан, модель: {model}")
 
-    def _build_user_prompt(self, fingers: int) -> str:
-        mode = "DIM" if self.dim_mode else "BRIGHT"
-        return f'fingers={fingers} mode={mode}'
-
-    def _deterministic_decision(self, fingers: int) -> dict:
+    def _deterministic_states(self, fingers: int) -> list:
         n = max(0, min(int(fingers), NUM_BULBS))
-        states = [True] * n + [False] * (NUM_BULBS - n)
-        return {
-            "states": states,
-            "brightness": "dim" if self.dim_mode else "bright",
-            "reasoning": f"fallback: {fingers} пальцев"
-        }
+        return [True] * n + [False] * (NUM_BULBS - n)
 
-    def detect_fist_to_palm(self, fingers: int) -> bool:
-        if self.pattern_cooldown > 0:
-            self.pattern_cooldown -= 1
-            return False
-
+    def _detect_gesture(self, fingers: int) -> bool:
         self.history.append(fingers)
-        if len(self.history) > 4:
-            self.history = self.history[-4:]
+        if len(self.history) > 6:
+            self.history = self.history[-6:]
 
         if len(self.history) < 2:
             return False
 
-        prev = self.history[-2]
-        curr = self.history[-1]
-
-        if (prev, curr) in [(0, 5), (5, 0)]:
-            return True
-        return False
-
-    def update_dim_mode(self):
-        if self.dim_mode:
-            log.info("Режим DIM -> BRIGHT (ярко)")
-            self.dim_mode = False
-        else:
-            log.info("Режим BRIGHT -> DIM (тускло)")
-            self.dim_mode = True
-
-        self.history = []
-        self.pattern_cooldown = 3
-        self.pattern_detections += 1
+        prev, curr = self.history[-2], self.history[-1]
+        return (prev, curr) in [(0, 5), (5, 0)]
 
     def _parse_llm_response(self, content: str) -> dict | None:
-        json_match = re.search(r'\{[^{}]*\}', content)
-        parsed = None
-        if json_match:
-            try:
-                parsed = json.loads(json_match.group(0))
-            except Exception:
-                parsed = None
-
-        if parsed is None or not isinstance(parsed, dict):
-            array_match = re.search(r'\[[^\[\]]*\]', content)
-            if array_match:
-                bools = re.findall(r'\b(true|false|1|0)\b', array_match.group(0), re.IGNORECASE)
-                if len(bools) == NUM_BULBS:
-                    return {
-                        "states": [b.lower() in ("true", "1") for b in bools],
-                        "brightness": "dim" if self.dim_mode else "bright",
-                        "reasoning": "извлечено из текста"
-                    }
-            return None
-
-        states_raw = parsed.get("states")
-        if states_raw is None:
-            return None
-
-        if isinstance(states_raw, dict):
-            states_raw = list(states_raw.values())
-
-        if isinstance(states_raw, str):
-            bools = re.findall(r'\b(true|false|1|0)\b', states_raw, re.IGNORECASE)
-            if len(bools) != NUM_BULBS:
-                return None
-            states_raw = bools
-
-        if not isinstance(states_raw, (list, tuple)) or len(states_raw) != NUM_BULBS:
-            return None
-
-        states = []
-        for x in states_raw:
-            if isinstance(x, bool):
-                states.append(x)
-            elif isinstance(x, (int, float)):
-                states.append(bool(x))
-            elif isinstance(x, str):
-                states.append(x.lower() in ("true", "1", "yes"))
-            else:
-                states.append(False)
-
-        brightness_raw = parsed.get("brightness", "").lower()
-        if "dim" in brightness_raw or "тускло" in brightness_raw:
-            brightness = "dim"
-        else:
-            brightness = "bright"
-
-        return {
-            "states": states,
-            "brightness": brightness,
-            "reasoning": parsed.get("reasoning", "")
-        }
+        array_match = re.search(r'\[[^\[\]]*\]', content)
+        if array_match:
+            bools = re.findall(r'\b(true|false|1|0)\b', array_match.group(0), re.IGNORECASE)
+            if len(bools) == NUM_BULBS:
+                return {
+                    "states": [b.lower() in ("true", "1") for b in bools],
+                    "brightness": "dim" if self.dim_mode else "bright",
+                }
+        return None
 
     async def ask_llm(self, fingers: int) -> dict:
-        fallback = self._deterministic_decision(fingers)
+        n = max(0, min(int(fingers), NUM_BULBS))
+        expected = [True] * n + [False] * (NUM_BULBS - n)
 
-        try:
-            loop = asyncio.get_event_loop()
+        for attempt in range(3):
+            try:
+                loop = asyncio.get_event_loop()
 
-            def _call():
-                return ollama.chat(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": self._build_user_prompt(fingers)},
-                    ],
-                    format="json",
-                    options={"temperature": 0},
+                def _call():
+                    mode = "DIM" if self.dim_mode else "BRIGHT"
+                    user_msg = f"fingers={fingers} mode={mode}"
+                    return ollama.chat(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        format="json",
+                        options={"temperature": 0},
+                    )
+
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(None, _call),
+                    timeout=5.0,
                 )
 
-            start = time.time()
-            response = await asyncio.wait_for(
-                loop.run_in_executor(None, _call),
-                timeout=10.0,
-            )
-            elapsed = time.time() - start
+                content = response["message"]["content"].strip()
+                log.debug(f"LLM attempt {attempt + 1}: {content!r}")
 
-            content = response["message"]["content"].strip()
-            log.debug(f"LLM ({elapsed:.2f}с) RAW: {content!r}")
+                parsed = self._parse_llm_response(content)
+                if parsed is None:
+                    continue
 
-            parsed = self._parse_llm_response(content)
-            if parsed is None:
-                log.warning(f"Парсинг не удался, fallback. RAW: {content!r}")
-                return fallback
+                if parsed["states"] == expected:
+                    return parsed
+                else:
+                    log.warning(f"Попытка {attempt + 1}: {parsed['states']} != {expected}")
+            except asyncio.TimeoutError:
+                log.warning(f"Попытка {attempt + 1}: timeout")
+            except Exception as e:
+                log.warning(f"Попытка {attempt + 1}: {e}")
 
-            n = max(0, min(int(fingers), NUM_BULBS))
-            true_count = sum(parsed["states"])
-
-            if true_count != n:
-                log.warning(f"LLM: {true_count} true != {n} пальцев, исправляю")
-                fallback_states = [True] * n + [False] * (NUM_BULBS - n)
-                parsed["states"] = fallback_states
-
-            return parsed
-
-        except asyncio.TimeoutError:
-            log.error("LLM timeout, fallback")
-        except Exception as e:
-            log.error(f"LLM error: {e}, fallback")
-
-        return fallback
+        log.error(f"LLM 3 раза ошиблась, fallback")
+        return {
+            "states": expected,
+            "brightness": "dim" if self.dim_mode else "bright",
+        }
 
     async def decide(self, fingers: int) -> dict:
-        if self.detect_fist_to_palm(fingers):
-            self.update_dim_mode()
-            decision = self._deterministic_decision(fingers)
-            decision["reasoning"] = f"Кулак→Ладонь: {'тускло' if self.dim_mode else 'ярко'}"
-            self.bulb_states = decision["states"]
-            self.last_fingers = fingers
-            return decision
-
+        # Кэш
         if fingers == self.last_fingers:
             self.cache_hits += 1
             return {
                 "states": self.bulb_states,
                 "brightness": "dim" if self.dim_mode else "bright",
-                "reasoning": "кэш"
             }
 
+        # Проверка стабильности
+        self.history.append(fingers)
+        if len(self.history) > 6:
+            self.history = self.history[-6:]
+
+        if len(self.history) < 3 or not (self.history[-1] == self.history[-2] == self.history[-3]):
+            self.skipped_unstable += 1
+            log.debug(f"Жест {fingers} нестабилен ({self.history[-3:]}), пропускаю LLM")
+            states = self._deterministic_states(fingers)
+            self.bulb_states = states
+            return {
+                "states": states,
+                "brightness": "dim" if self.dim_mode else "bright",
+            }
+
+        # Жест стабилен — вызываем LLM
         self.last_fingers = fingers
         self.llm_calls += 1
 
+        if self._detect_gesture(fingers):
+            self.gesture_detections += 1
+            if self.dim_mode:
+                log.info("Режим DIM -> BRIGHT")
+                self.dim_mode = False
+            else:
+                log.info("Режим BRIGHT -> DIM")
+                self.dim_mode = True
+
         decision = await self.ask_llm(fingers)
         self.bulb_states = decision["states"]
-        log.info(f"Решение: {decision['reasoning']}")
+
+        log.info(f"Пальцев: {fingers} → {self.bulb_states}")
         return decision
 
     def stats(self) -> str:
         return (f"LLM: {self.llm_calls}, кэш: {self.cache_hits}, "
-                f"паттернов: {self.pattern_detections}, "
+                f"пропуски: {self.skipped_unstable}, "
+                f"жестов: {self.gesture_detections}, "
                 f"режим: {'DIM' if self.dim_mode else 'BRIGHT'}")
 
 
@@ -235,29 +176,29 @@ async def connect_to_sensor():
         try:
             log.info(f"Подключаюсь к сенсору ws://{SENSOR_HOST}:{SENSOR_PORT}...")
             async with websockets.connect(
-                f"ws://{SENSOR_HOST}:{SENSOR_PORT}",
-                ping_interval=20,
-                ping_timeout=10,
+                    f"ws://{SENSOR_HOST}:{SENSOR_PORT}",
+                    ping_interval=20,
+                    ping_timeout=10,
             ) as sensor_ws:
                 log.info("Подключён к сенсору")
 
                 while True:
                     data = await sensor_ws.recv()
                     payload = json.loads(data)
+
                     fingers = payload.get("fingers", 0)
                     hand = payload.get("hand_detected", False)
+                    camera_alive = payload.get("camera_alive", False)
 
-                    if not hand:
+                    if not hand or not camera_alive:
+                        if agent and agent.last_fingers != 0:
+                            agent.last_fingers = -1
                         continue
 
                     if agent is None:
-                        log.error("agent is None!")
                         continue
 
                     decision = await agent.decide(fingers)
-                    log.info(f"Пальцев: {fingers} → {decision['states']} "
-                             f"({decision['brightness']}) | {agent.stats()}")
-
         except (ConnectionRefusedError, OSError) as e:
             log.warning(f"Сенсор недоступен ({e}), повтор через 2с...")
             await asyncio.sleep(2)
@@ -271,7 +212,8 @@ async def connect_to_sensor():
 
 
 async def site_handler(websocket):
-    log.info(f"Сайт подключился: {websocket.remote_address}")
+    peer = websocket.remote_address
+    log.info(f"Сайт подключился: {peer}")
     try:
         while True:
             if agent is None:
@@ -280,13 +222,12 @@ async def site_handler(websocket):
                 payload = {
                     "states": agent.bulb_states,
                     "brightness": "dim" if agent.dim_mode else "bright",
-                    "reasoning": f"Режим: {'тускло' if agent.dim_mode else 'ярко'}",
                     "stats": agent.stats()
                 }
             await websocket.send(json.dumps(payload))
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
     except websockets.ConnectionClosed:
-        log.info("Сайт отключился")
+        log.info(f"Сайт отключился: {peer}")
     except Exception as e:
         log.error(f"Ошибка в site_handler: {e}")
 
