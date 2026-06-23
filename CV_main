@@ -21,7 +21,8 @@ def init_mediapipe():
     model_path = Path("hand_landmarker.task")
     if not model_path.exists():
         log.error(f"Файл {model_path} не найден!")
-
+        log.error("Скачай: https://storage.googleapis.com/mediapipe-models/"
+                  "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task")
         return None
 
     try:
@@ -96,6 +97,14 @@ def draw_hand(frame, landmarks) -> int:
     return fingers
 
 
+def is_frame_black(frame) -> bool:
+    """Проверяет, не чёрный ли кадр (камера закрыта или отвалилась)."""
+    if frame is None:
+        return True
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.mean(gray)[0] < 5
+
+
 async def sensor_loop(websocket):
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -116,20 +125,61 @@ async def sensor_loop(websocket):
     executor = ThreadPoolExecutor(max_workers=2)
     frame_count = 0
     last_log = time.time()
+    consecutive_failures = 0
+    window_alive = True
+    camera_dead = False
 
     try:
-        while True:
+        while window_alive:
             try:
                 success, frame = await loop.run_in_executor(executor, cap.read)
             except Exception as e:
                 log.error(f"Кадр не прочитался: {e}")
+                consecutive_failures += 1
+                if consecutive_failures > 10:
+                    log.error("Камера перестала отвечать, выхожу")
+                    break
                 await asyncio.sleep(0.5)
                 continue
 
-            if not success:
-                log.warning("Пустой кадр от камеры")
+            if not success or frame is None:
+                consecutive_failures += 1
+                if consecutive_failures > 10:
+                    log.error("Камера не возвращает кадры, выхожу")
+                    break
                 await asyncio.sleep(0.1)
                 continue
+
+            consecutive_failures = 0
+
+            if is_frame_black(frame):
+                if not camera_dead:
+                    log.warning("Кадр чёрный — камера закрыта или чем-то закрыта")
+                    camera_dead = True
+                cv2.putText(frame, "Camera blocked", (30, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                cv2.imshow("Vision Sensor Feed", frame)
+                cv2.waitKey(1)
+
+                try:
+                    await asyncio.wait_for(
+                        websocket.send(json.dumps({
+                            "fingers": 0,
+                            "hand_detected": False,
+                            "camera_alive": False,
+                            "timestamp": time.time()
+                        })),
+                        timeout=0.1,
+                    )
+                except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                    pass
+
+                await asyncio.sleep(0.1)
+                continue
+
+            if camera_dead:
+                log.info("Камера снова жива")
+                camera_dead = False
 
             frame = cv2.flip(frame, 1)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -141,7 +191,9 @@ async def sensor_loop(websocket):
                 log.error(f"MediaPipe упал: {e}")
                 result = None
 
-            if result and result.hand_landmarks:
+            hand_detected = bool(result and result.hand_landmarks)
+
+            if hand_detected:
                 fingers = draw_hand(frame, result.hand_landmarks[0])
             else:
                 fingers = 0
@@ -152,13 +204,15 @@ async def sensor_loop(websocket):
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 log.info("Закрытие по 'q'")
+                window_alive = False
                 break
 
             try:
                 await asyncio.wait_for(
                     websocket.send(json.dumps({
                         "fingers": fingers,
-                        "hand_detected": bool(result and result.hand_landmarks),
+                        "hand_detected": hand_detected,
+                        "camera_alive": True,
                         "timestamp": time.time()
                     })),
                     timeout=0.1,
@@ -166,7 +220,7 @@ async def sensor_loop(websocket):
             except asyncio.TimeoutError:
                 log.debug("Агент не успевает, пропускаю")
             except websockets.ConnectionClosed:
-                log.warning("Агент отвалился")
+                log.warning("Агент отвалился, жду его обратно")
                 break
 
             frame_count += 1
