@@ -1,0 +1,86 @@
+import logging
+import subprocess
+import sys
+import time
+
+
+SENSOR_HOST = "localhost"
+SENSOR_PORT = 9000
+SITE_HOST = "localhost"
+SITE_PORT = 8765
+
+OLLAMA_MODEL = "llama3.1"
+NUM_BULBS = 5
+
+
+def setup_logger(name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    stream = sys.stdout
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s | %(name)-8s | %(levelname)-5s | %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    logger.addHandler(handler)
+    return logger
+
+
+def is_ollama_running() -> bool:
+    try:
+        import ollama
+        ollama.list()
+        return True
+    except Exception:
+        return False
+
+
+def start_ollama_if_needed(log) -> bool:
+    if is_ollama_running():
+        log.info("Ollama уже работает")
+        return True
+
+    log.warning("Ollama не отвечает, пробую запустить...")
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(
+                ["ollama", "serve"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except FileNotFoundError:
+        log.error("Ollama не найдена")
+        return False
+
+    log.info("Жду пока Ollama поднимется...")
+    for i in range(30):
+        time.sleep(1)
+        if is_ollama_running():
+            log.info(f"Ollama готова ({i + 1} сек)")
+            return True
+
+    log.error("Ollama так и не стартовала за 30 секунд")
+    return False
+
+
+def ensure_model_available(model: str, log) -> bool:
+    try:
+        import ollama
+        models = ollama.list()
+        names = [m.model for m in models.get("models", [])]
+        if any(n.startswith(model) for n in names):
+            log.info(f"Модель {model} ")
+            return True
+        log.warning(f"Модель {model} не скачана. Выполни: ollama pull {model}")
+        return False
+    except Exception as e:
+        log.error(f"Не получилось проверить модели: {e}")
+        return False
