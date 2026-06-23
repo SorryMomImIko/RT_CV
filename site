@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MediaPipe Agent Control Panel</title>
+    <style>
+        * { box-sizing: border-box; }
+
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #aaaaaa;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+
+        .status-panel {
+            font-size: 14px;
+            color: #ccc;
+            margin-bottom: 30px;
+            padding: 15px 20px;
+            background: #1e1e1e;
+            border-radius: 8px;
+            border: 1px solid #333;
+            min-width: 400px;
+            text-align: center;
+        }
+
+        #ws-status {
+            font-weight: bold;
+            color: #ff5252;
+        }
+
+        .stats-line {
+            font-size: 11px;
+            color: #666;
+            margin-top: 8px;
+            font-family: monospace;
+        }
+
+        .bulbs-container {
+            display: flex;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        .bulb {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background-color: #333;
+            box-shadow:
+                inset 0 -5px 15px rgba(0,0,0,0.5),
+                0 0 10px rgba(0,0,0,0.8);
+            cursor: pointer;
+            transition: all 0.4s ease-in-out;
+            position: relative;
+        }
+
+        .bulb.on {
+            background-color: #ffd700;
+            box-shadow:
+                inset 0 -5px 15px rgba(255, 215, 0, 0.2),
+                0 0 20px #ffd700,
+                0 0 40px #ffea00;
+        }
+
+        /* Режим DIM — тускло */
+        .bulb.on.dim {
+            background-color: #b8860b;
+            box-shadow:
+                inset 0 -5px 15px rgba(184, 134, 11, 0.2),
+                0 0 10px #b8860b,
+                0 0 20px rgba(184, 134, 11, 0.4);
+            opacity: 0.6;
+        }
+
+        .bulb::after {
+            content: '';
+            position: absolute;
+            bottom: -15px;
+            left: 15px;
+            width: 30px;
+            height: 15px;
+            background-color: #555;
+            border-radius: 0 0 5px 5px;
+        }
+
+        .info-box {
+            background: #1e1e1e;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+            max-width: 500px;
+            font-size: 13px;
+            color: #aaa;
+            text-align: center;
+            line-height: 1.5;
+        }
+
+        .info-box strong {
+            color: #ffd700;
+        }
+
+        .controls {
+            display: flex;
+            gap: 15px;
+            margin-top: 20px;
+        }
+
+        button {
+            padding: 12px 24px;
+            font-size: 14px;
+            background-color: #2c2c2c;
+            color: white;
+            border: 1px solid #555;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        button:hover { background-color: #444; }
+        button:active { background-color: #666; }
+    </style>
+</head>
+<body>
+
+    <h1>🤖 Панель управления ИИ-агента</h1>
+
+    <div class="info-box">
+        💡 Управляйте лампочками жестами перед камерой.<br>
+        🔄 Покажите <strong>1 раз подряд 0→5</strong>, чтобы переключить яркость.
+    </div>
+
+    <div class="status-panel">
+        Статус: <span id="ws-status">Отключен</span>
+        <br>
+        Решение агента: <span id="last-command" style="color: #fff;">-</span>
+        <div class="stats-line" id="stats-line"></div>
+    </div>
+
+    <div class="bulbs-container">
+        <div class="bulb" id="bulb-1" onclick="toggleBulb(1)"></div>
+        <div class="bulb" id="bulb-2" onclick="toggleBulb(2)"></div>
+        <div class="bulb" id="bulb-3" onclick="toggleBulb(3)"></div>
+        <div class="bulb" id="bulb-4" onclick="toggleBulb(4)"></div>
+        <div class="bulb" id="bulb-5" onclick="toggleBulb(5)"></div>
+    </div>
+
+    <div class="controls">
+        <button onclick="setAllBulbs(true)">Включить всё</button>
+        <button onclick="setAllBulbs(false)">Выключить всё</button>
+    </div>
+
+    <script>
+        // ─────────────────────────────────────────────
+        // РУЧНОЕ УПРАВЛЕНИЕ
+        // ─────────────────────────────────────────────
+        function toggleBulb(id) {
+            document.getElementById(`bulb-${id}`).classList.toggle('on');
+        }
+
+        function setAllBulbs(state) {
+            for (let i = 1; i <= 5; i++) {
+                document.getElementById(`bulb-${i}`).classList.toggle('on', state);
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // УПРАВЛЕНИЕ ОТ АГЕНТА
+        // ─────────────────────────────────────────────
+        function updateBulbsFromAgent(data) {
+            const states = data.states || [];
+            const brightness = data.brightness || "bright";
+            const reasoning = data.reasoning || "";
+
+            // Подпись "что думает агент"
+            if (reasoning) {
+                lastCommandDisplay.textContent = reasoning;
+            }
+
+            // Статистика
+            if (data.stats) {
+                statsLineDisplay.textContent = data.stats;
+            }
+
+            // Обновляем лампочки
+            for (let i = 0; i < 5; i++) {
+                const bulb = document.getElementById(`bulb-${i + 1}`);
+                if (states[i]) {
+                    bulb.classList.add('on');
+                    if (brightness === "dim") {
+                        bulb.classList.add('dim');
+                    } else {
+                        bulb.classList.remove('dim');
+                    }
+                } else {
+                    bulb.classList.remove('on');
+                    bulb.classList.remove('dim');
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // WEBSOCKET С АВТОПЕРЕПОДКЛЮЧЕНИЕМ
+        // ─────────────────────────────────────────────
+        const wsStatusDisplay = document.getElementById('ws-status');
+        const lastCommandDisplay = document.getElementById('last-command');
+        const statsLineDisplay = document.getElementById('stats-line');
+
+        let socket = null;
+        let reconnectTimer = null;
+        let reconnectDelay = 1000;
+        const RECONNECT_MIN = 1000;
+        const RECONNECT_MAX = 10000;
+
+        function setStatus(text, color) {
+            wsStatusDisplay.textContent = text;
+            wsStatusDisplay.style.color = color;
+        }
+
+        function connectWebSocket() {
+            if (socket && socket.readyState !== WebSocket.CLOSED) {
+                try { socket.close(); } catch (e) {}
+            }
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+
+            setStatus("Подключение...", "#ff9800");
+            console.log(`[WS] Подключаюсь к ws://localhost:8765`);
+
+            try {
+                socket = new WebSocket('ws://localhost:8765');
+            } catch (e) {
+                console.error("[WS] Ошибка:", e);
+                scheduleReconnect();
+                return;
+            }
+
+            socket.onopen = () => {
+                console.log("[WS] Подключён");
+                setStatus("Подключен", "#4caf50");
+                reconnectDelay = RECONNECT_MIN;
+            };
+
+            socket.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (Array.isArray(data.states)) {
+                        updateBulbsFromAgent(data);
+                    }
+                } catch (error) {
+                    console.warn("[WS] Parse error:", error);
+                }
+            };
+
+            socket.onclose = (event) => {
+                console.log(`[WS] Закрыт (code: ${event.code})`);
+                setStatus("Отключен (переподключение...)", "#ff5252");
+                scheduleReconnect();
+            };
+
+            socket.onerror = (error) => {
+                console.warn("[WS] Error:", error);
+            };
+        }
+
+        function scheduleReconnect() {
+            if (reconnectTimer) return;
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+                connectWebSocket();
+            }, reconnectDelay);
+        }
+
+        connectWebSocket();
+
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                if (!socket || socket.readyState !== WebSocket.OPEN) {
+                    reconnectDelay = RECONNECT_MIN;
+                    connectWebSocket();
+                }
+            }
+        });
+    </script>
+</body>
+</html>
